@@ -44,6 +44,9 @@ class VideoInterfaceNode(Node):
         self.timer = self.create_timer(1.0 / 30.0, self.on_timer)
         self.get_logger().info('VideoInterfaceNode initialized, streaming at 30Hz')
 
+        # Memory between frames
+        self.last_pose = -1
+
     def on_timer(self):
         # Pull the latest frame from the GStreamer appsink
         sample = self.sink.emit('pull-sample')
@@ -78,12 +81,21 @@ class VideoInterfaceNode(Node):
 
             # compute centre & area
             centre_x = (x1 + x2) / 2.0
+            print("centre raw: ", centre_x)
+            centre_x = centre_x * 0.625
+            print("centre alt: ", centre_x)
             area = areas[idx]
 
             msg = Point()
             msg.x = float(centre_x)      # horizontal position
             msg.y = 0.0                  # flat‑ground assumption
             msg.z = float(area)          # area acts as “distance” proxy
+            self.position_pub.publish(msg)
+        else:
+            msg = Point()
+            msg.x = 200.0  # object center x-coordinate
+            msg.y = 0.0  # y-coordinate unused
+            msg.z = 10001.0  # object area; >10000 indicates 'too close'
             self.position_pub.publish(msg)
         # optional: publish “no object” flag (e.g. area = ‑1) if nothing seen
 
@@ -105,11 +117,7 @@ class VideoInterfaceNode(Node):
         # x = horizontal center coordinate of the object
         # y = unused (flat-ground assumption)
         # z = object area (controller caps at 10000 to stop robot when object is too large)
-        msg = Point()
-        msg.x = 200.0  # object center x-coordinate
-        msg.y = 0.0  # y-coordinate unused
-        msg.z = 10001.0  # object area; >10000 indicates 'too close'
-        self.position_pub.publish(msg)
+        
         # To adjust robot behavior, apply a scaling factor to 'z' (e.g., couple with depth estimation)
         # Log at debug level if needed:
         # self.get_logger().debug(f'Published position: ({msg.x}, {msg.y}, {msg.z})')
