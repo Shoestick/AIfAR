@@ -165,6 +165,7 @@ class VideoInterfaceNode(Node):
                 # selected box data
                 x1, y1, x2, y2 = xyxy[idx]
                 centre_x = (x1 + x2) / 2.0        # px
+                centre_x = centre_x / width * 400.0
                 area     = areas[idx]
 
                 # update memory *before* publishing so next frame has it
