@@ -52,7 +52,7 @@ class VideoInterfaceNode(Node):
             self.session_dir = parent / timestamp   
             self.session_dir.mkdir(parents=True, exist_ok=True)       
             self.frame_idx = 0                      
-            self.get_logger().info(f'📷 Saving frames into {self.session_dir}')
+            self.get_logger().info(f'Saving frames into {self.session_dir}')
         if detect_choice in ['area', 'weighted']:
             self.detect_choice = detect_choice
         else:
@@ -154,7 +154,9 @@ class VideoInterfaceNode(Node):
 
                 # --- build composite score -------------------------------------------------
                 norm_area = np.sqrt(areas / float(width * height))      # 0-1
-                ious      = np.array([self._iou(bb, self.last_box) for bb in xyxy])
+                ious = np.array([self._iou(bb, self.last_box) for bb in xyxy]) \
+                if self.last_box is not None else np.zeros(n, dtype=float)
+
 
                 # weight hyper-parameters – tune to taste
                 w_conf, w_area, w_iou = 0.55, 0.25, 0.20
@@ -198,6 +200,7 @@ class VideoInterfaceNode(Node):
             msg.y = 0.0  # y-coordinate unused
             msg.z = 10001.0  # object area; >10000 indicates 'too close'
             self.position_pub.publish(msg)
+            self.last_box = None  # Reset last box if no object detected
             # To adjust robot behavior, apply a scaling factor to 'z' (e.g., couple with depth estimation)
             # Log at debug level if needed:
             # self.get_logger().debug(f'Published position: ({msg.x}, {msg.y}, {msg.z})')
