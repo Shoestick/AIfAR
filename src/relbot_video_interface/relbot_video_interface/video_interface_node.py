@@ -10,6 +10,7 @@ import sys
 import argparse               
 from pathlib import Path
 import datetime as dt   
+
        
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
@@ -47,12 +48,14 @@ class VideoInterfaceNode(Node):
         # ───── frame‑capture config ────────────────────────────
         self.save_frames = save_frames              
         if self.save_frames:                        
-            parent = Path(save_dir)                 
+            parent = Path(save_dir)             
             timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')  
             self.session_dir = parent / timestamp   
             self.session_dir.mkdir(parents=True, exist_ok=True)       
             self.frame_idx = 0                      
+            #self.get_logger().info
             print(f'Saving frames into {self.session_dir}')
+
         if detect_choice in ['area', 'weighted']:
             self.detect_choice = detect_choice
         else:
@@ -118,7 +121,8 @@ class VideoInterfaceNode(Node):
         buf.unmap(mapinfo)
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         # --- optional saving ------------------------------------------------
-        if self.save_frames:                                               
+        if self.save_frames:        
+            print("made it to saving")   # debug statement                                        
             filename = self.session_dir / f'{self.frame_idx:06d}.jpg'      
             cv2.imwrite(str(filename), frame_bgr)                          
             self.frame_idx += 1
@@ -144,7 +148,7 @@ class VideoInterfaceNode(Node):
 
                 # compute centre & area
                 centre_x = (x1 + x2) / 2.0
-                centre_x = centre_x / width * 320 - 20  # scale to 0-400 range
+                centre_x = centre_x / width * 320.0 - 20.0 # scale to 0-400 range
                 area = areas[idx]
                 
             ### Choose based on weighted average between Confidence, Area and IoU    
@@ -162,14 +166,14 @@ class VideoInterfaceNode(Node):
 
                 # weight hyper-parameters – tune to taste
                 w_conf, w_area, w_iou = 0.55, 0.25, 0.20
-                # normalise weights all values are already 0-1
+
                 score = w_conf * conf + w_area * norm_area + w_iou * ious
                 idx   = int(score.argmax())
 
                 # selected box data
                 x1, y1, x2, y2 = xyxy[idx]
                 centre_x = (x1 + x2) / 2.0        # px
-                centre_x = centre_x / width * 320 - 20
+                centre_x = centre_x / width * 320.0 - 20.0
                 area     = areas[idx]
 
                 # update memory *before* publishing so next frame has it
@@ -188,7 +192,7 @@ class VideoInterfaceNode(Node):
             msg = Point()
             msg.x = float(centre_x)      # horizontal position
             msg.y = 0.0                  # flat‑ground assumption
-            msg.z = float(area)          # area acts as “distance” proxy
+            msg.z = 500.0         # area acts as “distance” proxy
             self.position_pub.publish(msg)
         # optional: publish “no object” flag (e.g. area = ‑1) if nothing seen
         else: # If no object detected, publish the middle of the frame
@@ -259,7 +263,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # rclpy provides a helper to *remove* ROS-specific args
     user_args = rclpy.utilities.remove_ros_args(args=argv)
-    ros_args  = [a for a in argv if a not in user_args]
+    ros_args = [a for a in argv if a not in user_args]
 
     # ---------------------------------------------------------------------
     # Step 2 ‒ parse the remaining user arguments

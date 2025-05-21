@@ -1,3 +1,7 @@
+**/run1
+**/slam_save_1*
+**/README*
+
 .vscode/settings.json
 .vscode/c_cpp_properties.json
 log/COLCON_IGNORE
