@@ -11,6 +11,10 @@ import argparse
 from pathlib import Path
 import datetime as dt   
 
+from torchvision.models.detection import fasterrcnn_resnet50_fpn  # Just for example; use your actual MiDaS model
+import torch
+from torchvision import transforms
+from PIL import Image
        
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
@@ -35,6 +39,25 @@ def _iou(bb1, bb2):
     area1 = (bb1[2] - bb1[0]) * (bb1[3] - bb1[1])
     area2 = (bb2[2] - bb2[0]) * (bb2[3] - bb2[1])
     return inter / float(area1 + area2 - inter)
+
+def map_depth_to_distance(self, depth_val: float) -> float:
+        # Map MiDaS depth to robot's distance logic.        
+
+        if depth_val <= 0:
+            return 20000.0  # Handle invalid depth by stopping the robot
+
+        # Fixed depth range (tune as appropriate for your use case)
+        min_d = 0       # Closest meaningful depth
+        max_d = 30      # Farthest expected depth !!!! NOT SURE WHAT THE ACTUAL AVERAGE MAXIMUM IS !!!! (Mainly depends on which model you use)
+
+        # Map raw_depth to the min/max range
+        depth_val = max(min_d, min(depth_val, max_d))
+
+        # Normalize and invert
+        norm = (depth_val - min_d) / (max_d - min_d)  # 0 (close) → 1 (far)
+        mapped_z = 20000.0 - norm * 19000.0           # 20000 (close) → 1000 (far)
+
+        return float(mapped_z)
 # ────────────────────────────────────────────────────────────
 
 class VideoInterfaceNode(Node):
@@ -99,6 +122,15 @@ class VideoInterfaceNode(Node):
         self.last_box = None  # Last known position of the object
         
         # SIDE loading of the model
+        # MiDaS model loading
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.midas = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid")
+        self.midas.to(self.device).eval()
+
+        # Correct transform for DPT_Hybrid
+        midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+        self.midas_transform = midas_transforms.dpt_transform
+        print("MiDaS model loaded successfully")
 
     def on_timer(self):
         # Pull the latest frame from the GStreamer appsink
@@ -182,7 +214,29 @@ class VideoInterfaceNode(Node):
             
             ## TODO: Insert single depth estimation logic here to determine the distance
             # --- Single Image Depth Estimation -----------------------------------------------
-            
+            # Convert BGR frame to RGB PIL Image for MiDaS
+            img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            img_pil = Image.fromarray(img_rgb)
+            input_batch = self.midas_transform(img_pil).to(self.midas.device).unsqueeze(0)
+
+            # Estimate depth
+            with torch.no_grad():
+                prediction = self.midas(input_batch)
+                prediction = torch.nn.functional.interpolate(
+                    prediction.unsqueeze(1),
+                    size=(height, width),
+                    mode="bicubic",
+                    align_corners=False,
+                ).squeeze()
+
+            depth_map = prediction.cpu().numpy()
+
+            # Get depth in the bounding box
+            object_region_depth = depth_map[int(y1):int(y2), int(x1):int(x2)]
+            if object_region_depth.size == 0:
+                depth_value = -1.0  # Fallback if box is empty
+            else:
+                depth_value = float(np.median(object_region_depth))  # You could also use np.max or np.mean
             ## TODO: After single image depth estimation determine the proper z value
             # --- Calculate scaling factor for z ---------------------------------------------
             # update memory *before* publishing so next frame has it
@@ -192,7 +246,9 @@ class VideoInterfaceNode(Node):
             msg = Point()
             msg.x = float(centre_x)      # horizontal position
             msg.y = 0.0                  # flat‑ground assumption
-            msg.z = 500.0         # area acts as “distance” proxy
+            mapped_depth = map_depth_to_distance(depth_value)
+            msg.z = mapped_depth
+            #msg.z = 500.0         # area acts as “distance” proxy
             self.position_pub.publish(msg)
         # optional: publish “no object” flag (e.g. area = ‑1) if nothing seen
         else: # If no object detected, publish the middle of the frame
@@ -215,6 +271,7 @@ class VideoInterfaceNode(Node):
         # Visualize the frame with YOLO detections
         annotated = results.plot()
         cv2.imshow('YOLOv8 Live', annotated)
+        cv2.putText(annotated, f"Depth: {depth_value:.2f}", (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         cv2.waitKey(1)
         
         # keeps the window responsive
@@ -222,9 +279,7 @@ class VideoInterfaceNode(Node):
         #cv2.imshow('Input Stream', cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         #cv2.waitKey(1)
 
-        # TODO: Insert detection/tracking logic here to compute object position
 
-        # TODO: Insert detection/tracking logic here to compute object position
         
         
 
