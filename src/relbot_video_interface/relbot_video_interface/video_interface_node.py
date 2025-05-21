@@ -52,7 +52,7 @@ class VideoInterfaceNode(Node):
             self.session_dir = parent / timestamp   
             self.session_dir.mkdir(parents=True, exist_ok=True)       
             self.frame_idx = 0                      
-            self.get_logger().info(f'Saving frames into {self.session_dir}')
+            print(f'Saving frames into {self.session_dir}')
         if detect_choice in ['area', 'weighted']:
             self.detect_choice = detect_choice
         else:
@@ -94,6 +94,8 @@ class VideoInterfaceNode(Node):
         # Memory and confidence management
         self.confidence_threshold = 0.3  # Confidence threshold for detections
         self.last_box = None  # Last known position of the object
+        
+        # SIDE loading of the model
 
     def on_timer(self):
         # Pull the latest frame from the GStreamer appsink
@@ -142,7 +144,7 @@ class VideoInterfaceNode(Node):
 
                 # compute centre & area
                 centre_x = (x1 + x2) / 2.0
-                centre_x = centre_x / width * 400.0  # scale to 0-400 range
+                centre_x = centre_x / width * 320 - 20  # scale to 0-400 range
                 area = areas[idx]
                 
             ### Choose based on weighted average between Confidence, Area and IoU    
@@ -154,20 +156,20 @@ class VideoInterfaceNode(Node):
 
                 # --- build composite score -------------------------------------------------
                 norm_area = np.sqrt(areas / float(width * height))      # 0-1
-                ious = np.array([self._iou(bb, self.last_box) for bb in xyxy]) \
+                ious = np.array([_iou(bb, self.last_box) for bb in xyxy]) \
                 if self.last_box is not None else np.zeros(n, dtype=float)
 
 
                 # weight hyper-parameters – tune to taste
                 w_conf, w_area, w_iou = 0.55, 0.25, 0.20
-
+                # normalise weights all values are already 0-1
                 score = w_conf * conf + w_area * norm_area + w_iou * ious
                 idx   = int(score.argmax())
 
                 # selected box data
                 x1, y1, x2, y2 = xyxy[idx]
                 centre_x = (x1 + x2) / 2.0        # px
-                centre_x = centre_x / width * 400.0
+                centre_x = centre_x / width * 320 - 20
                 area     = areas[idx]
 
                 # update memory *before* publishing so next frame has it
@@ -256,8 +258,8 @@ def main(argv: list[str] | None = None) -> None:
         argv = sys.argv[1:]
 
     # rclpy provides a helper to *remove* ROS-specific args
-    ros_args = rclpy.utilities.remove_ros_args(args=argv)
-    user_args = [a for a in argv if a not in ros_args]
+    user_args = rclpy.utilities.remove_ros_args(args=argv)
+    ros_args  = [a for a in argv if a not in user_args]
 
     # ---------------------------------------------------------------------
     # Step 2 ‒ parse the remaining user arguments
