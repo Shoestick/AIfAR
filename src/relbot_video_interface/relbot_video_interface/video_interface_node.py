@@ -40,24 +40,48 @@ def _iou(bb1, bb2):
     area2 = (bb2[2] - bb2[0]) * (bb2[3] - bb2[1])
     return inter / float(area1 + area2 - inter)
 
-def map_depth_to_distance(self, depth_val: float) -> float:
+def _prepare_batch(rgb: np.ndarray, tfm, device) -> torch.Tensor:
+    t = tfm(rgb)
+    if isinstance(t, dict):
+        t = t["image"]
+    if t.dim() == 3:
+        t = t.unsqueeze(0)
+    return t.to(device) 
+
+def normalize_depth(depth: np.ndarray, clip: float = 2.0):
+    lo, hi = np.percentile(depth, [clip, 100.0 - clip])
+    depth_clipped = np.clip(depth, lo, hi)
+    depth_norm = (depth_clipped - lo) / (hi - lo + 1e-8)
+    return depth_norm.astype(np.float32), lo, hi
+
+def map_depth_to_distance(depth_val: float) -> float:
         # Map MiDaS depth to robot's distance logic.        
 
-        if depth_val <= 0:
-            return 20000.0  # Handle invalid depth by stopping the robot
+        # if depth_val <= 0:
+        #     return 20000.0  # Handle invalid depth by stopping the robot
 
-        # Fixed depth range (tune as appropriate for your use case)
-        min_d = 0       # Closest meaningful depth
-        max_d = 30      # Farthest expected depth !!!! NOT SURE WHAT THE ACTUAL AVERAGE MAXIMUM IS !!!! (Mainly depends on which model you use)
+        # # Fixed depth range (tune as appropriate for your use case)
+        # min_d = 0       # Closest meaningful depth
+        # max_d = 1      # Farthest expected depth !!!! NOT SURE WHAT THE ACTUAL AVERAGE MAXIMUM IS !!!! (Mainly depends on which model you use)
 
-        # Map raw_depth to the min/max range
-        depth_val = max(min_d, min(depth_val, max_d))
+        # # Map raw_depth to the min/max range
+        # depth_val = max(min_d, min(depth_val, max_d))
 
-        # Normalize and invert
-        norm = (depth_val - min_d) / (max_d - min_d)  # 0 (close) → 1 (far)
-        mapped_z = 20000.0 - norm * 19000.0           # 20000 (close) → 1000 (far)
+        # # Normalize and invert
+        # norm = (depth_val - min_d) / (max_d - min_d)  # 0 (close) → 1 (far)
+        # norm = 1 - norm
+        # mapped_z = max(20000.0 - norm * 25000.0 , 100)          # 20000 (close) → 1000 (far)
+        if depth_val < 0.9:
+            return 1000.0
+        else:
+            return 10001.0
 
-        return float(mapped_z)
+
+        # 0return float(mapped_z)
+
+def depth_to_colormap(depth_norm: np.ndarray) -> np.ndarray:
+    depth_u8 = (depth_norm * 255).astype(np.uint8)
+    return cv2.applyColorMap(depth_u8, cv2.COLORMAP_MAGMA)
 # ────────────────────────────────────────────────────────────
 
 class VideoInterfaceNode(Node):
@@ -124,7 +148,7 @@ class VideoInterfaceNode(Node):
         # SIDE loading of the model
         # MiDaS model loading
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.midas = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid")
+        self.midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
         self.midas.to(self.device).eval()
 
         # Correct transform for DPT_Hybrid
@@ -168,6 +192,12 @@ class VideoInterfaceNode(Node):
         # SET placeholders for center_x and area
         centre_x = 0.0
         area = 0.0
+        depth_value = 0
+        x1 = 0
+        x2 = 0
+        y1 = 0
+        y2 = 0
+        depth_vis = None
         if n > 0:
             ### choose the *largest* detection, if any
             if self.detect_choice == 'area':
@@ -216,8 +246,8 @@ class VideoInterfaceNode(Node):
             # --- Single Image Depth Estimation -----------------------------------------------
             # Convert BGR frame to RGB PIL Image for MiDaS
             img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            img_pil = Image.fromarray(img_rgb)
-            input_batch = self.midas_transform(img_pil).to(self.midas.device).unsqueeze(0)
+            #img_pil = Image.fromarray(img_rgb)
+            input_batch = _prepare_batch(img_rgb, self.midas_transform, self.device)
 
             # Estimate depth
             with torch.no_grad():
@@ -230,9 +260,10 @@ class VideoInterfaceNode(Node):
                 ).squeeze()
 
             depth_map = prediction.cpu().numpy()
-
+            norm_depth, lo, hi = normalize_depth(depth_map)
+            depth_vis = depth_to_colormap(norm_depth)
             # Get depth in the bounding box
-            object_region_depth = depth_map[int(y1):int(y2), int(x1):int(x2)]
+            object_region_depth = norm_depth[int(y1):int(y2), int(x1):int(x2)]
             if object_region_depth.size == 0:
                 depth_value = -1.0  # Fallback if box is empty
             else:
@@ -247,8 +278,9 @@ class VideoInterfaceNode(Node):
             msg.x = float(centre_x)      # horizontal position
             msg.y = 0.0                  # flat‑ground assumption
             mapped_depth = map_depth_to_distance(depth_value)
-            msg.z = mapped_depth
-            #msg.z = 500.0         # area acts as “distance” proxy
+            print('mapped depth', mapped_depth)
+            # msg.z = 100.0
+            msg.z = mapped_depth        # area acts as “distance” proxy
             self.position_pub.publish(msg)
         # optional: publish “no object” flag (e.g. area = ‑1) if nothing seen
         else: # If no object detected, publish the middle of the frame
@@ -270,9 +302,18 @@ class VideoInterfaceNode(Node):
         # --- Visualisation -------------------------------------------------
         # Visualize the frame with YOLO detections
         annotated = results.plot()
-        cv2.imshow('YOLOv8 Live', annotated)
-        cv2.putText(annotated, f"Depth: {depth_value:.2f}", (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        cv2.waitKey(1)
+        if depth_vis is not None:
+            cv2.putText(depth_vis, f"Depth: {depth_value:.2f}", (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            combo = np.hstack([annotated, depth_vis])
+            cv2.imshow("All Assignments Live", combo)
+            cv2.waitKey(1)
+        else:
+            combo = np.hstack([frame_bgr, annotated])
+            cv2.imshow("All Assignments Live", combo)
+            cv2.waitKey(1)
+        # cv2.imshow('YOLOv8 Live', annotated)
+        # cv2.putText(annotated, f"Depth: {depth_value:.2f}", (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        # cv2.waitKey(1)
         
         # keeps the window responsive
         # Display the raw input frame for debugging
