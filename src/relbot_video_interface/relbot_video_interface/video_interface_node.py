@@ -10,7 +10,9 @@ import sys
 import argparse               
 from pathlib import Path
 import datetime as dt   
-
+import time
+from time import perf_counter
+import csv
 from torchvision.models.detection import fasterrcnn_resnet50_fpn  # Just for example; use your actual MiDaS model
 import torch
 from torchvision import transforms
@@ -88,7 +90,8 @@ class VideoInterfaceNode(Node):
     def __init__(self,
                  detect_choice: str = 'area',  # 'area' or 'weighted'
                  save_frames: bool = False,         
-                 save_dir: str = 'captured_frames'   
+                 save_dir: str = 'captured_frames',
+                 calculate_depth: bool = True  # Whether to capture depth or not (if not will use bounding box size to determine distance from the robot to the object)  
                  ):
         super().__init__('video_interface')
         
@@ -144,19 +147,31 @@ class VideoInterfaceNode(Node):
         # Memory and confidence management
         self.confidence_threshold = 0.3  # Confidence threshold for detections
         self.last_box = None  # Last known position of the object
-        
-        # SIDE loading of the model
-        # MiDaS model loading
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
-        self.midas.to(self.device).eval()
+        if self.calculate_depth:
+            # SIDE loading of the model
+            # MiDaS model loading
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+            self.midas.to(self.device).eval()
 
-        # Correct transform for DPT_Hybrid
-        midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-        self.midas_transform = midas_transforms.dpt_transform
-        print("MiDaS model loaded successfully")
+            # Correct transform for DPT_Hybrid
+            midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+            self.midas_transform = midas_transforms.dpt_transform
+            print("MiDaS model loaded successfully")
+        
+        # Saving fps and timing data into a csv file
+        # ─── timing CSV ──────────────────────────────────────────────
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.csv_path = Path(f"timings_{ts}.csv")
+        self.csv_file = self.csv_path.open("w", newline="")
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(["frame", "dt_yolo_ms",
+                                "dt_depth_ms", "dt_total_ms", "fps"])
+        self.frame_counter = 0
+
 
     def on_timer(self):
+        t0 = perf_counter()  # Start timer for performance measurement
         # Pull the latest frame from the GStreamer appsink
         sample = self.sink.emit('pull-sample')
         if not sample:
@@ -185,7 +200,11 @@ class VideoInterfaceNode(Node):
                         
         # --- Inference -------------------------------------------------------------------------
         # single Results object in list
-        results = self.model(frame_bgr, imgsz=640, conf=self.confidence_threshold, device="cpu", stream=False)[0]
+        t_y0 = perf_counter()
+        results = self.model(frame_bgr, imgsz=640,
+                            conf=self.confidence_threshold,
+                            device="cpu", stream=False)[0]
+        dt_yolo = (perf_counter() - t_y0) * 1e3  # ms
         boxes = results.boxes
         n = len(boxes)  # number of detections
         
@@ -241,34 +260,45 @@ class VideoInterfaceNode(Node):
                 # update memory *before* publishing so next frame has it
                 self.last_box = xyxy[idx].copy()
             
-            
-            ## TODO: Insert single depth estimation logic here to determine the distance
+            if self.calculate_depth:
             # --- Single Image Depth Estimation -----------------------------------------------
             # Convert BGR frame to RGB PIL Image for MiDaS
-            img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            #img_pil = Image.fromarray(img_rgb)
-            input_batch = _prepare_batch(img_rgb, self.midas_transform, self.device)
+            
+                img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                #img_pil = Image.fromarray(img_rgb)
+                input_batch = _prepare_batch(img_rgb, self.midas_transform, self.device)
 
-            # Estimate depth
-            with torch.no_grad():
-                prediction = self.midas(input_batch)
-                prediction = torch.nn.functional.interpolate(
-                    prediction.unsqueeze(1),
-                    size=(height, width),
-                    mode="bicubic",
-                    align_corners=False,
-                ).squeeze()
+                # Estimate depth
+                t_d0 = perf_counter()
+                with torch.no_grad():
+                    prediction = self.midas(input_batch)
+                    prediction = torch.nn.functional.interpolate(
+                        prediction.unsqueeze(1),
+                        size=(height, width),
+                        mode="bicubic",
+                        align_corners=False,
+                    ).squeeze()
+                dt_depth = (perf_counter() - t_d0) * 1e3  # ms
 
-            depth_map = prediction.cpu().numpy()
-            norm_depth, lo, hi = normalize_depth(depth_map)
-            depth_vis = depth_to_colormap(norm_depth)
-            # Get depth in the bounding box
-            object_region_depth = norm_depth[int(y1):int(y2), int(x1):int(x2)]
-            if object_region_depth.size == 0:
-                depth_value = -1.0  # Fallback if box is empty
-            else:
-                depth_value = float(np.median(object_region_depth))  # You could also use np.max or np.mean
-            ## TODO: After single image depth estimation determine the proper z value
+                depth_map = prediction.cpu().numpy()
+                norm_depth, lo, hi = normalize_depth(depth_map)
+                depth_vis = depth_to_colormap(norm_depth)
+                # Get depth in the bounding box
+                object_region_depth = norm_depth[int(y1):int(y2), int(x1):int(x2)]
+                if object_region_depth.size == 0:
+                    depth_value = -1.0  # Fallback if box is empty
+                else:
+                    depth_value = float(np.median(object_region_depth))  # You could also use np.max or np.mean
+                    
+            else: # Determine the depth based on the size of the bounding box
+                width_box = abs(x2 - x1)
+                height_box = abs(y2 - y1)
+                print(f"width_box: {width_box}, height_box: {height_box}")
+                # Based on the width and height set a threshold for when the person is too close
+                if width_box < 50 and height_box < 50:
+                    depth_value = 1000.0
+                else:
+                    depth_value = 10001.0
             # --- Calculate scaling factor for z ---------------------------------------------
             # update memory *before* publishing so next frame has it
             
@@ -277,7 +307,11 @@ class VideoInterfaceNode(Node):
             msg = Point()
             msg.x = float(centre_x)      # horizontal position
             msg.y = 0.0                  # flat‑ground assumption
-            mapped_depth = map_depth_to_distance(depth_value)
+            mapped_depth = 0.0
+            if self.calculate_depth:
+                mapped_depth = map_depth_to_distance(depth_value)
+            else:
+                mapped_depth = depth_value # passed from the bounding box size
             print('mapped depth', mapped_depth)
             # msg.z = 100.0
             msg.z = mapped_depth        # area acts as “distance” proxy
@@ -319,6 +353,24 @@ class VideoInterfaceNode(Node):
         # Display the raw input frame for debugging
         #cv2.imshow('Input Stream', cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         #cv2.waitKey(1)
+        dt_total = (perf_counter() - t0) * 1e3    # ms
+        fps = 1000.0 / dt_total if dt_total > 0 else 0.0
+
+        # ── console log ─────────────────────────────────────────────
+        print(f"[{self.frame_counter:05d}]  "
+            f"YOLO {dt_yolo:6.1f} ms   "
+            f"MiDaS {dt_depth:6.1f} ms   "
+            f"tot {dt_total:6.1f} ms   "
+            f"{fps:6.1f} fps")
+
+        # ── CSV append ──────────────────────────────────────────────
+        self.csv_writer.writerow([self.frame_counter,
+                                f"{dt_yolo:.3f}",
+                                f"{dt_depth:.3f}",
+                                f"{dt_total:.3f}",
+                                f"{fps:.2f}"])
+        self.frame_counter += 1
+
 
 
         
@@ -327,6 +379,7 @@ class VideoInterfaceNode(Node):
     def destroy_node(self):
         # Cleanup GStreamer resources on shutdown
         self.pipeline.set_state(Gst.State.NULL)
+        self.csv_file.close()
         super().destroy_node()
 
 
@@ -378,6 +431,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--save_dir",
                         default="captured_frames",
                         help="Root directory for saved frame sessions")
+    parser.add_argument("--calculate_depth",
+                        action="store_true",
+                        help="Enable depth estimation using MiDaS model")
 
     opts = parser.parse_args(user_args)
 
@@ -388,7 +444,8 @@ def main(argv: list[str] | None = None) -> None:
 
     node = VideoInterfaceNode(detect_choice=opts.detect_choice,
                               save_frames=opts.save_frames,
-                              save_dir=opts.save_dir)
+                              save_dir=opts.save_dir,
+                              calculate_depth=opts.calculate_depth)
 
     try:
         rclpy.spin(node)
